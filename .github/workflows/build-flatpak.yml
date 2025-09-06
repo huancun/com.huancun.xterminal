@@ -277,10 +277,10 @@ jobs:
         
         # 准备要上传的文件列表
         
-        # 添加Flatpak bundles和签名文件
+        # 添加Flatpak bundles
         for arch in x86_64 aarch64; do
           BUNDLE_FILE="flatpak-$VERSION-$arch/com.huancun.xterminal-$VERSION-$arch.flatpak"
-          MANIFEST_FILE="manifest-$VERSION-$arch/com.huancun.xterminal-$VERSION-$arch..yaml"
+          MANIFEST_FILE="manifest-$VERSION-$arch/com.huancun.xterminal-$VERSION-$arch.yaml"
           
           if [ -f "$BUNDLE_FILE" ]; then
             FILES_TO_UPLOAD="$FILES_TO_UPLOAD $BUNDLE_FILE"
