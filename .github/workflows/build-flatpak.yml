@@ -1,0 +1,324 @@
+# 工作流名称
+name: Build and Release Flatpak
+
+# 触发工作流的事件
+on:
+  # 定时任务触发
+  schedule:
+    # 每天凌晨2点 (UTC) 运行，检查是否有新版本
+    - cron: '0 2 * * *'
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: '强制构建，即使没有新版本'
+        required: false
+        default: 'false'
+        type: boolean
+
+# 为工作流中所有作业设置默认权限
+permissions:
+  contents: write # 允许向仓库写入内容，例如创建Release
+
+# 定义工作流中的作业
+jobs:
+  # 作业1: 检查最新版本
+  check-version:
+    name: Check XTerminal Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      tag_name: ${{ steps.get-version.outputs.tag_name }}
+      should_build: ${{ steps.check-build.outputs.should_build }}
+    
+    steps:
+    # 步骤1: 检出代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    # 步骤2: 从API获取最新的XTerminal版本信息
+    - name: Get latest XTerminal release
+      id: get-version
+      run: |
+        echo "=== Fetching latest release from API ==="
+        
+        # 从指定API获取版本信息
+        RELEASE_INFO=$(curl -s "https://api.xterminal.cn/server/electron/version3")
+        
+        echo "API Response:"
+        echo "$RELEASE_INFO" | jq '.'
+        
+        # 使用jq解析JSON，提取Linux版本号
+        VERSION=$(echo "$RELEASE_INFO" | jq -r '.linux.version // empty')
+        
+        # 如果无法获取版本号，则使用备用版本并退出
+        if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+          echo "Error: Failed to get version from API response"
+          exit 1
+        fi
+        
+        # 根据版本号构造tag_name
+        TAG_NAME="v$VERSION"
+        
+        # 将版本号和tag_name设置为step的输出
+        echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        echo "Latest XTerminal version: $VERSION (tag: $TAG_NAME)"
+        
+    # 步骤3: 检查是否需要构建
+    - name: Check if build is needed
+      id: check-build
+      run: |
+        VERSION="${{ steps.get-version.outputs.version }}"
+        FORCE_BUILD="${{ github.event.inputs.force_build }}"
+        
+        echo "Checking if build is needed for version: $VERSION"
+        
+        # 如果是强制构建，则直接设置为true
+        if [ "$FORCE_BUILD" = "true" ]; then
+          echo "Force build requested"
+          echo "should_build=true" >> $GITHUB_OUTPUT
+        else
+          # 检查当前仓库是否已存在对应版本的Release
+          EXISTING_RELEASE=$(curl -s "https://api.github.com/repos/${{ github.repository }}/releases/tags/v$VERSION" | jq -r '.tag_name // empty')
+          
+          if [ -z "$EXISTING_RELEASE" ] || [ "$EXISTING_RELEASE" = "empty" ]; then
+            echo "Version $VERSION not found in releases, building..."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "Version $VERSION already exists, skipping build"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+        fi
+
+  # 作业2: 构建Flatpak包
+  build-flatpak:
+    name: Build XTerminal Flatpak
+    needs: check-version # 依赖于 check-version 作业
+    if: needs.check-version.outputs.should_build == 'true' # 仅当需要构建时运行
+    runs-on: ubuntu-latest # 运行环境
+    strategy:
+      matrix:
+        arch: [x86_64, aarch64] # 构建矩阵，为x86_64和aarch64两种架构分别构建
+    
+    steps:
+    # 步骤1: 检出代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    # 步骤2: 设置Flatpak环境
+    - name: Set up Flatpak
+      run: |
+        # 更新包列表并安装Flatpak相关工具
+        sudo apt-get update
+        sudo apt-get install -y flatpak flatpak-builder qemu-user-static binutils
+        
+        # 添加Flathub远程仓库
+        sudo flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+        
+        # 为当前架构安装Flatpak运行时和SDK
+        sudo flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
+        
+        # 如果是aarch64架构，安装交叉编译所需的运行时和SDK
+        if [ "${{ matrix.arch }}" = "aarch64" ]; then
+          echo "Installing aarch64 runtime and SDK..."
+          sudo flatpak install -y flathub org.freedesktop.Platform/aarch64/24.08 org.freedesktop.Sdk/aarch64/24.08
+          sudo flatpak install -y flathub org.freedesktop.Sdk.Extension.toolchain-aarch64//24.08
+          
+          # 启用QEMU进行aarch64模拟
+          sudo systemctl restart systemd-binfmt
+          echo "QEMU setup completed for aarch64"
+        fi
+        
+    # 步骤3: 准备Flatpak清单文件
+    - name: Prepare Flatpak manifest
+      run: |
+        # 从依赖作业获取版本信息
+        VERSION="${{ needs.check-version.outputs.version }}"
+        TAG_NAME="${{ needs.check-version.outputs.tag_name }}"
+        ARCH="${{ matrix.arch }}"
+        CDN_URL="https://cdn-cn.xterminal.cn/downloads/"
+
+        # 将Flatpak架构映射到XTerminal二进制文件的架构名称
+        case $ARCH in
+          "x86_64")
+            XTERMINAL_ARCH="amd64"
+            ;;
+          "aarch64")
+            XTERMINAL_ARCH="arm64"
+            ;;
+        esac
+        
+        # 根据模板构造文件名和下载URL
+        DEB_FILENAME="XTerminal-${VERSION}-linux-${XTERMINAL_ARCH}.deb"
+        DOWNLOAD_URL="${CDN_URL}${DEB_FILENAME}"
+        DEB_FILE=$DEB_FILENAME
+
+
+        echo "=== Version Information ==="
+        echo "VERSION: $VERSION"
+        echo "Architecture: $ARCH (XTerminal: $XTERMINAL_ARCH)"
+        
+        # 下载官方.deb包
+        echo "=== Downloading binary from $DOWNLOAD_URL ==="
+        if ! wget -O "$DEB_FILE" "$DOWNLOAD_URL"; then
+          echo "Error: Failed to download binary for $XTERMINAL_ARCH"
+          exit 1
+        fi
+
+        # 计算tar.gz的SHA256哈希值
+        BINARY_SHA256=$(sha256sum "XTerminal-${VERSION}-linux-${XTERMINAL_ARCH}.deb" | awk '{print $1}')
+        echo "SHA256: $BINARY_SHA256"
+        
+        # 使用sed命令更新清单(YAML)文件中的占位符
+        echo "=== Updating Flatpak manifest ==="
+        sed  -e "s|BINARY_SHA256|$BINARY_SHA256|g" \
+            -e "s|XTERMINAL_ARCH|$XTERMINAL_ARCH|g" \
+            -e "s|VERSION|$VERSION|g" \
+            com.huancun.xterminal.yaml > "com.huancun.xterminal-$VERSION-$ARCH.yaml"
+        
+        # 更新MetaInfo文件中的版本和日期
+        CURRENT_DATE=$(date +%Y-%m-%d)
+        sed -e "s|PLACEHOLDER_VERSION|$VERSION|g" \
+            -e "s|PLACEHOLDER_DATE|$CURRENT_DATE|g" \
+            com.huancun.xterminal.metainfo.xml > "com.huancun.xterminal-$VERSION.metainfo.xml"
+        
+        # 复制更新后的MetaInfo文件
+        cp "com.huancun.xterminal-$VERSION.metainfo.xml" com.huancun.xterminal.metainfo.xml
+        
+        # 清理已下载的二进制文件 (flatpak-builder会重新下载)
+        rm -f "xterminal-linux-$XTERMINAL_ARCH.tar.gz"
+        
+        echo "Generated manifest: com.huancun.xterminal-$VERSION-$ARCH.yaml"
+        cat "com.huancun.xterminal-$VERSION-$ARCH.yaml"
+        
+    # 步骤4: 构建Flatpak包
+    - name: Build Flatpak
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        ARCH="${{ matrix.arch }}"
+        
+        echo "=== Building Flatpak for $ARCH ==="
+        
+        # 为aarch64设置交叉编译参数
+        if [ "$ARCH" = "aarch64" ]; then
+          export FLATPAK_BUILDER_ARCH="aarch64"
+          BUILD_ARGS="--arch=aarch64"
+        else
+          BUILD_ARGS=""
+        fi
+        
+        # 运行flatpak-builder进行构建
+        flatpak-builder $BUILD_ARGS --force-clean --repo=repo "build-$ARCH" "com.huancun.xterminal-$VERSION-$ARCH.yaml"
+        
+        echo "=== Flatpak build completed ==="
+        
+    # 步骤5: 导出Flatpak bundle文件
+    - name: Export Flatpak bundle
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        ARCH="${{ matrix.arch }}"
+        
+        echo "=== Exporting Flatpak bundle ==="
+        
+        # 为aarch64设置导出参数
+        if [ "$ARCH" = "aarch64" ]; then
+          BUNDLE_ARGS="--arch=aarch64"
+        else
+          BUNDLE_ARGS=""
+        fi
+        
+        # 导出为.flatpak文件
+        flatpak build-bundle $BUNDLE_ARGS repo "com.huancun.xterminal-$VERSION-$ARCH.flatpak" com.huancun.xterminal
+        
+        echo "Generated bundle: com.huancun.xterminal-$VERSION-$ARCH.flatpak"
+        ls -la "com.huancun.xterminal-$VERSION-$ARCH.flatpak"
+        
+    # 步骤6: 上传Flatpak构建产物
+    - name: Upload Flatpak artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: flatpak-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+        path: com.huancun.xterminal-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.flatpak
+        retention-days: 90 # 保留90天
+        
+    # 步骤7: 上传清单文件构建产物
+    - name: Upload manifest artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: manifest-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}
+        path: com.huancun.xterminal-${{ needs.check-version.outputs.version }}-${{ matrix.arch }}.yaml
+        retention-days: 90
+
+  # 作业3: 创建GitHub Release
+  create-release:
+    name: Create GitHub Release
+    needs: [check-version, build-flatpak] # 依赖于check-version和build-flatpak作业
+    if: needs.check-version.outputs.should_build == 'true' # (已注释)
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 步骤1: 检出代码
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    # 步骤2: 下载所有构建产物
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      
+    # 步骤3: 创建GitHub Release
+    - name: Create GitHub Release
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        VERSION="${{ needs.check-version.outputs.version }}"
+        TAG_NAME="${{ needs.check-version.outputs.tag_name }}"
+        SOURCE_TAG="${{ needs.check-version.outputs.tag_name }}"
+        
+        # 准备要上传的文件列表
+        
+        # 添加Flatpak bundles和签名文件
+        for arch in x86_64 aarch64; do
+          BUNDLE_FILE="flatpak-$VERSION-$arch/com.huancun.xterminal-$VERSION-$arch.flatpak"
+          MANIFEST_FILE="manifest-$VERSION-$arch/com.huancun.xterminal-$VERSION-$arch..yaml"
+          
+          if [ -f "$BUNDLE_FILE" ]; then
+            FILES_TO_UPLOAD="$FILES_TO_UPLOAD $BUNDLE_FILE"
+          fi
+          
+          if [ -f "$MANIFEST_FILE" ]; then
+            FILES_TO_UPLOAD="$FILES_TO_UPLOAD $MANIFEST_FILE"
+          fi
+        done
+        
+        # 使用GitHub CLI (gh) 创建Release
+        gh release create "$TAG_NAME" \
+          --title "XTerminal Flatpak $VERSION" \
+          --notes "## Flatpak Package for XTerminal $VERSION
+
+        This is an automated Flatpak package build from [${{ github.repository }} $SOURCE_TAG](https://github.com/${{ github.repository }}/releases/tag/$SOURCE_TAG).
+
+        ### 📦 Package Information
+        - **Source**: ${{ github.repository }} $SOURCE_TAG
+        - **Package Version**: $VERSION
+        - **Build Date**: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+        - **Architectures**: x86_64, aarch64
+        - **Application ID**: \`com.huancun.xterminal\`
+        - **Runtime**: org.freedesktop.Platform 24.08
+
+        " \
+          $FILES_TO_UPLOAD
+
+  # 作业4: 清理
+  cleanup:
+    name: Cleanup
+    needs: [check-version, build-flatpak, create-release] # (已注释)
+    if: always() # 无论之前的作业是否成功，总是运行
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Cleanup artifacts
+      run: |
+        echo "Build and release process completed"
+        echo "Version: ${{ needs.check-version.outputs.version }}"
+        echo "Should build: ${{ needs.check-version.outputs.should_build }}"

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=XTerminal
+Exec=xterminal %U
+Terminal=false
+Type=Application
+Icon=com.huancun.xterminal
+StartupWMClass=XTerminal
+Comment=Xterminal tools
+Categories=Utility;

@@ -1,0 +1,42 @@
+id: com.huancun.xterminal
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+command: xterminal
+separate-locales: false
+
+finish-args:
+  - --share=ipc
+  - --socket=x11
+  - --share=network
+  - --socket=pulseaudio
+  - --device=all
+  - --socket=ssh-auth
+  - --filesystem=home
+
+modules:
+  - name: xterminal
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 com.huancun.xterminal.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 com.huancun.xterminal.png -t /app/share/icons/hicolor/512x512/apps/
+      - install -Dm644 com.huancun.xterminal.desktop -t /app/share/applications/
+      - ar -x XTerminal.deb
+      - tar -xf data.tar.xz
+      - mv opt/XTerminal /app/xterminal
+      - chmod +x /app/xterminal/xterminal
+      - install -d /app/bin
+      - echo '#!/bin/sh' > /app/bin/xterminal
+      - echo 'exec /app/xterminal/xterminal --no-sandbox "$@"' >> /app/bin/xterminal
+      - chmod +x /app/bin/xterminal
+    sources:
+      - type: file
+        path: com.huancun.xterminal.metainfo.xml
+      - type: file
+        path: com.huancun.xterminal.png
+      - type: file
+        path: com.huancun.xterminal.desktop
+      - type: file
+        dest-filename: XTerminal.deb
+        url: https://cdn-cn.xterminal.cn/downloads/XTerminal-VERSION-linux-XTERMINAL_ARCH.deb
+        sha256: BINARY_SHA256
